@@ -7,7 +7,7 @@ on:
   # 支持在 Actions 页面手动触发，便于验证配置是否生效
   workflow_dispatch:
   schedule:
-    - cron: '00 0 * * *'  # UTC 00:00，即北京时间 08:00
+    - cron: '00 1 * * *'  # UTC 00:00，即北京时间 08:00
 
 jobs:
   run-nodeseek-daily:
