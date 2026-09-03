@@ -231,6 +231,15 @@ class CheckinRejected(RuntimeError):
     """服务端明确拒绝签到（ok:0 且非「已签到」类文案），属业务失败而非流程异常。"""
 
 
+class LoginVerificationRequired(RuntimeError):
+    """
+    站点风控要求邮箱二次确认登录（2026-09-01 Actions 实测：密码验证通过后
+    跳到 user_review_login_email 页等待邮箱确认，登录态并未建立）。这不是
+    流程异常也不是环境抽风——重开浏览器重试只会再触发一封确认邮件，必须
+    直接上抛：人工在本地完成邮箱验证登录并更新 Cookie 后方可恢复。
+    """
+
+
 class _Stage:
     """
     记录浏览器流程当前所处阶段，失败时写进异常信息便于定位是哪一步挂的。
@@ -671,6 +680,13 @@ def browser_sign_in(creds):
         # 该站登录表单只在 /login 呈现，登录成功后其他页面不再有密码输入框；
         # 登录失败停留在 /login（表单恒在）会在此超时并明确报错
         wait.until(lambda d: 'name="password"' not in (d.page_source or ""))
+        # 邮箱验证页没有 password 输入框（上面的等待会通过），但不能当成
+        # 登录成功——登录态要等邮箱确认后才建立。见 LoginVerificationRequired
+        if "user_review_login_email" in (driver.current_url or ""):
+            raise LoginVerificationRequired(
+                "站点要求邮箱验证登录（新 IP/设备风控，停在 user_review_login_email"
+                " 页），自动登录无法完成：请在本地浏览器登录 linux.sb 完成邮箱"
+                "验证，再复制 Cookie 更新 LINUXSB_COOKIE")
         print(f"[linux.sb] 账号密码登录成功（URL {driver.current_url}），开始签到")
 
         # 以同一浏览器会话访问签到页并执行签到（与 Cookie 通道共用同一段逻辑）。
@@ -681,6 +697,10 @@ def browser_sign_in(creds):
     except CheckinRejected as exc:
         # 服务端明确拒绝签到属业务结果，按失败上报即可，不必重开浏览器重试
         return False, str(exc), None
+    except LoginVerificationRequired:
+        # 邮箱验证只能人工完成，重开浏览器只会再触发一封确认邮件：直接上抛，
+        # 也不走 _browser_failure 包装（URL 已足够定位，无需再 dump 页面）
+        raise
     except Exception as exc:
         raise _browser_failure(driver, stage, exc, "登录/签到") from exc
     finally:
@@ -705,6 +725,8 @@ def _browser_with_retry(action, func, arg, max_attempts=_BROWSER_LOGIN_MAX_ATTEM
 
     CookieExpired 不重试直接上抛：Cookie 失效重开浏览器也不会变有效，
     由调用方转去账号密码兜底登录才有意义。
+    LoginVerificationRequired 同样直接上抛：邮箱验证只能人工完成，重试只会
+    再触发一封确认邮件，还可能加重风控。
     每次尝试打印动作名与序号，便于从日志分辨是「一次都没成」还是「第 N 次才成」。
     """
     last_error = None
@@ -713,7 +735,7 @@ def _browser_with_retry(action, func, arg, max_attempts=_BROWSER_LOGIN_MAX_ATTEM
             if attempt > 1:
                 print(f"[linux.sb] 浏览器{action}第 {attempt} 次重试（共 {max_attempts} 次）")
             return func(arg)
-        except CookieExpired:
+        except (CookieExpired, LoginVerificationRequired):
             raise
         except Exception as exc:
             last_error = exc
@@ -775,12 +797,15 @@ def parse_cookies(raw_cookie):
 
 def fetch_checkin_state(cookie):
     """
-    访问签到页，返回 (csrf_token, 是否已签到, 是否为登录页)。
+    访问签到页，返回 (csrf_token, 是否已签到, 是否未取得登录态)。
 
-    注意区分「签到页」与「登录页」：未登录访问 /daily_checkin 会被 302 到
-    /login，而登录页的登录表单同样带 name="_csrf" 隐藏字段——若把登录页的
-    CSRF 当作有效凭据，会在未登录状态下提交出「假签到成功」。因此 URL 落在
-    /login 或页面含密码输入框时视为 cookie 失效，csrf 返回 None。
+    注意区分「签到页」与「未登录」：未登录访问 /daily_checkin 会被 302 到
+    /login；站点还会按客户端环境把 requests 弹到登录邮箱二次确认页
+    user_review_login_email（2026-09-01 实测：同一份 Cookie，requests 探测
+    落在验证页，浏览器注入后登录态有效）。这两种「未取得登录态」的页面
+    都返回 is_login=True，由调用方转浏览器 Cookie 通道复核——登录页的
+    登录表单同样带 name="_csrf" 隐藏字段，若把它当有效凭据，会在未登录
+    状态下提交出「假签到成功」，故此时 csrf 返回 None。
 
     站点开启 Cloudflare 托管挑战时抛 CloudflareChallenged（而非通用异常），
     由调用方切换到浏览器通道；其余非 200 才是真正的请求失败。
@@ -802,13 +827,33 @@ def fetch_checkin_state(cookie):
 
     html = response.text
     final_url = getattr(response, "url", None) or CHECKIN_URL
-    # 登录页特征：最终 URL 是 /login，或 HTML 含登录表单的密码输入框
-    if "/login" in final_url or 'name="password"' in html:
+    # 未取得登录态的页面特征之一：登录表单的密码输入框（先算好复用，
+    # f-string 表达式不能含反斜杠转义——旧版 Python 直接语法报错）
+    has_password_field = 'name="password"' in html
+    # 探测结果的一行取证日志：排查「探测返回什么导致走了某分支」全靠它
+    # （不打印 cookie 与页面正文，只打特征与长度，无凭据泄漏）
+    print(f"[linux.sb] 探测签到页：HTTP {response.status_code}，URL {final_url}，"
+          f"长度 {len(html)}，csrf={'有' if CSRF_RE.search(html) else '无'}，"
+          f"password框={has_password_field}，"
+          f"已签到={CHECKED_IN_TEXT in html}", flush=True)
+    # 未取得登录态的三种特征：最终 URL 是 /login 或登录邮箱确认页，
+    # 或 HTML 含登录表单的密码输入框
+    if ("/login" in final_url
+            or "user_review_login_email" in final_url
+            or has_password_field):
         return None, CHECKED_IN_TEXT in html, True
 
     match = CSRF_RE.search(html)
     csrf = match.group(1) if match else None
     checked_in = CHECKED_IN_TEXT in html
+    if csrf is None and not checked_in:
+        # 已登录的签到页必渲染 csrf（签到表单）或「已签到」文案，两者皆无
+        # 说明站点把本请求当作未登录访客渲染了未登录版页面（HTTP 200、URL
+        # 不变——2026-09-01 取证日志实测，站点按客户端环境歧视 requests：
+        # 同一份 Cookie，requests 拿到无 csrf 的未登录版页面，浏览器注入后
+        # 登录态有效签到成功）。按未登录处理转浏览器复核，绝不能误判
+        # Cookie 失效直闯账号密码登录兜底（登录会撞邮箱验证风控）
+        return None, False, True
     return csrf, checked_in, False
 
 
@@ -972,7 +1017,8 @@ def sign_in_account(cookie):
 
     if csrf is None:
         # 仅当页面是真正的签到页（模板不再渲染 _csrf 字段）时才回退到
-        # cookie 中的 bbs_csrf；登录页说明 cookie 已失效，绝不兜底（否则假签到）
+        # cookie 中的 bbs_csrf；登录/邮箱验证页说明 requests 环境未取得
+        # 登录态，绝不兜底（否则假签到）
         if not is_login_page:
             page_csrf = (parse_cookies(cookie) or {}).get("bbs_csrf")
             if page_csrf:
@@ -1101,19 +1147,38 @@ def run():
         started_at = time.strftime("%Y-%m-%d %H:%M:%S")
         try:
             # 先探测当前账号 cookie 是否有效：有效直接在 requests 通道签到；被
-            # Cloudflare 挑战拦截则转浏览器 Cookie 通道；登录态缺失（302 到
-            # /login）则转账号密码登录。仅 LINUXSB_COOKIE 阳性账号探测。
-            # 探测与 requests 签到放在同一个 try 内：挑战可能在探测通过之后才
-            # 生效（站点中途开盾），两处命中都要走同一条浏览器兜底路径。
+            # Cloudflare 挑战拦截、或 requests 被弹回登录页（可能只是站点按
+            # 客户端环境歧视 requests，见下方 is_login 分支）都转浏览器 Cookie
+            # 通道；浏览器内仍无登录态才转账号密码登录。仅 LINUXSB_COOKIE
+            # 阳性账号探测。探测与 requests 签到放在同一个 try 内：挑战可能
+            # 在探测通过之后才生效（站点中途开盾），两处命中都要走同一条
+            # 浏览器兜底路径。
             result = None  # requests 通道已出结果时为 (成功, 摘要, 用户名)
             # 与 bool(cookie) 相与：无 Cookie 账号本就该直接走账号密码通道，
             # 强制开关不能把 None 送进浏览器 Cookie 通道
             cf_blocked = force_browser and bool(cookie)
             if cookie and not force_browser:
                 try:
-                    csrf, _checked_in, is_login = fetch_checkin_state(cookie)
+                    csrf, checked_in, is_login = fetch_checkin_state(cookie)
                     if csrf is not None and not is_login:
                         result = sign_in_account(cookie)
+                    elif is_login:
+                        # requests 被弹回登录页不一定是 Cookie 失效：站点会按
+                        # 客户端环境校验会话（2026-09-01 实测：同一份 Cookie，
+                        # requests 探测 302 到 /login，浏览器注入后登录态有效
+                        # 且签到成功）。先转浏览器 Cookie 通道复核，浏览器内
+                        # 仍未登录才是真失效，才值得动用账号密码登录（登录
+                        # 兜底可能撞上邮箱验证风控，是最后手段）
+                        cf_blocked = True
+                        print("[linux.sb] requests 通道未取得登录态（站点可能按"
+                              "客户端环境校验会话），改用浏览器注入 Cookie 复核")
+                    elif checked_in:
+                        # 已签到页不渲染 _csrf（csrf=None）：当天早些时候已签过
+                        # （如浏览器通道签过、或当天重复执行），直接按成功收尾，
+                        # 绝不能掉进「Cookie 失效」分支再触发登录兜底
+                        summary, username = _build_summary(
+                            ["签到结果: 今日已签到，无需重复签到"], cookie)
+                        result = (True, summary, username)
                 except CloudflareChallenged as challenge:
                     # requests 通道整条不可用（签到 POST 与概览 GET 同样会被拦），
                     # 必须整体改走浏览器，不能只补这一个请求
@@ -1127,7 +1192,8 @@ def run():
                 try:
                     success, summary, username = browser_cookie_sign_in_with_retry(cookie)
                 except CookieExpired as expired:
-                    # 浏览器已过挑战但仍未登录：Cookie 本身失效，转账号密码兜底
+                    # 浏览器环境（过盾后）仍未取得登录态：Cookie 对站点真失效，
+                    # 转账号密码兜底（或无凭据时直接报失效）
                     print(f"[linux.sb] 浏览器内 Cookie 未取得登录态（{expired}）")
                     if creds and not login_used:
                         print("[linux.sb] 改用账号密码浏览器登录并签到")
