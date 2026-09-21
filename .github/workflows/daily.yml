@@ -12,7 +12,7 @@ on:
         type: boolean
         default: false
   schedule:
-    - cron: '53 16 * * *'  # UTC 00:00，即北京时间 08:00
+    - cron: '53 0 * * *'  # UTC 00:00，即北京时间 08:00
 
 jobs:
   run-nodeseek-daily:
